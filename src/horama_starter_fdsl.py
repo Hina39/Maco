@@ -1,7 +1,7 @@
 
-import argparse
 import os
 import pathlib
+import random
 from functools import lru_cache
 
 import matplotlib.pyplot as plt
@@ -9,21 +9,16 @@ import numpy as np
 import timm
 import torch
 import torch.nn.functional as F
-from horama import plot_maco
-from horama.plots import check_format, clip_percentile, normalize
-from timm.data.transforms import MaybeToTensor
-from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+from horama.plots import plot_maco
 from torchvision import datasets
 from torchvision.datasets.utils import download_url
 from torchvision.ops import roi_align
-from torchvision.transforms import (
-    CenterCrop,
-    Compose,
-    InterpolationMode,
-    Normalize,
-    Resize,
-)
 from tqdm import tqdm
+
+
+def worker_init_fn(worker_id):
+    random.seed(worker_id)
 
 """
 common.pyの中身
@@ -80,6 +75,8 @@ def optimization_step(objective_function, image, box_size, noise_level,
     assert box_size[1] >= box_size[0]
     assert len(image.shape) == 3
 
+    # print(image.shape) #torch.Size([3, 1280, 1280])
+
     device = image.device
     image.retain_grad()
 
@@ -98,6 +95,8 @@ def optimization_step(objective_function, image, box_size, noise_level,
 
     cropped_and_resized_images = roi_align(image.unsqueeze(
         0), boxes, output_size=(model_input_size, model_input_size)).squeeze(0)
+    
+    # print(cropped_and_resized_images.shape) #torch.Size([6, 3, 224, 224])
 
     # add normal and uniform noise for better robustness
     cropped_and_resized_images.add_(torch.randn_like(cropped_and_resized_images) * noise_level)
@@ -107,6 +106,8 @@ def optimization_step(objective_function, image, box_size, noise_level,
     # compute the score and loss
     score = objective_function(cropped_and_resized_images)
     loss = -score
+
+    # print(image.shape) #torch.Size([3, 1280, 1280])
 
     return loss, image
 
@@ -149,7 +150,7 @@ def init_maco_buffer(image_shape, std_deviation=1.0, dataloader=0):
 
     if dataloader == 0:
         magnitude_path = pathlib.Path(
-            "outputs/magnitude_FDSL.pth"
+            "outputs/magnitude_FDSL_test.pth"
         )
         if magnitude_path.exists():
             print("dataloader 確認！保存済みマグニチュードをロードします🤘")
@@ -157,28 +158,21 @@ def init_maco_buffer(image_shape, std_deviation=1.0, dataloader=0):
         else:
             print("dataloader 指定！データセットから FFT 平均マグニチュード計算開始🤘")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            transform = Compose(
-                [
-                    Resize(
-                        248,
-                        interpolation=InterpolationMode.BICUBIC,
-                        max_size=None,
-                        antialias=True,
-                    ),
-                    CenterCrop((224, 224)),
-                    MaybeToTensor(),
-                ]
-            )
-            dataset = datasets.ImageFolder(
-                root=pathlib.Path("data/FractalDB-1k"), transform=transform
-            )
-            dataloader = DataLoader(
-                dataset,
-                batch_size=32,
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True,
-            )
+
+            normalize = transforms.Normalize(mean=[0.2, 0.2, 0.2], std=[0.5, 0.5, 0.5])
+
+            # val_transform = transforms.Compose([transforms.Resize((224,224), interpolation=2),
+            #                                     transforms.ToTensor(), normalize])
+            # train_transform = transforms.Compose([transforms.RandomCrop((224,224)),
+            #     transforms.ToTensor(), normalize])
+            test_transform = transforms.Compose([
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize
+            ])
+            dataset = datasets.ImageFolder("data/FractalDB-1k", transform=test_transform)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True,
+                                                        num_workers=8, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
             # 画像のチャネル数は最初のサンプルから取得
             sample_img, _ = dataset[0]
             channels = sample_img.shape[0]
@@ -275,6 +269,34 @@ def maco_fdsl(objective_function, total_steps=1000, learning_rate=1.0, image_siz
 
     return final_image, transparency_accumulator
 
+"""
+ここのnormalize関数がhorama_starter_fdsl.pyのものと違う
+"""
+
+# def numpy_normalize(image, mean, std):
+#     # image: [H, W, C] を想定
+#     mean = np.array(mean).reshape(1, 1, -1)
+#     std = np.array(std).reshape(1, 1, -1)
+#     return (image - mean) / std
+
+
+# def plot_maco(image, alpha, percentile_image=1.0, percentile_alpha=80):
+#     # visualize image with alpha mask overlay after normalization and clipping
+#     image, alpha = check_format(image), check_format(alpha)
+#     image = clip_percentile(image, percentile_image)
+#     # normalize = transforms.Normalize(mean=[0.2, 0.2, 0.2], std=[0.5, 0.5, 0.5])
+#     # image = normalize(image)
+#     normalized_image = numpy_normalize(image, [0.2, 0.2, 0.2], [0.5, 0.5, 0.5])
+
+#     # mean of alpha across channels, clipping, and normalization
+#     alpha = np.mean(alpha, -1, keepdims=True)
+#     alpha = np.clip(alpha, None, np.percentile(alpha, percentile_alpha))
+#     alpha = alpha / alpha.max()
+
+#     # overlay alpha mask on the image
+#     plt.imshow(np.concatenate([normalized_image, alpha], -1))
+#     plt.axis('off')
+
 
 if __name__ == "__main__":
 
@@ -285,6 +307,13 @@ if __name__ == "__main__":
     学習済のモデルの重み：FractalDB-1000_res50.pth
     """
     model = timm.create_model('resnet50', pretrained=False).cuda().eval()
+    
+    # from FractalDB.resnet import resnet50
+    # parser = argparse.ArgumentParser(description='Horama FDSL')
+    # parser.add_argument('--numof_classes', type=int, default=1000)
+    # args = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = resnet50(pretrained=False, num_classes=args.numof_classes).to(device)
     model.load_state_dict(torch.load('weights/FractalDB-1000_resnet50_epoch90.pth'))
 
     objective = lambda images: torch.mean(model(images)[:, 388])
@@ -323,21 +352,27 @@ if __name__ == "__main__":
     # plt.savefig("horama_output.png")  # 画像を保存する
     # plt.close()  # 図を閉じる
 
-    # for crop_size in [0.75, 0.85, 0.90, 0.95]:
     for crop_size in [0.10, 0.25, 0.50, 0.60, 0.80]:
-        img, alpha = maco_fdsl(objective, values_range = (0, 1), box_size = (crop_size, crop_size))
+        img, alpha = maco_fdsl(objective, values_range = (-2.5, 2.5), box_size = (crop_size, crop_size))
 
-        percentile_image=1.0
-        image, alpha = check_format(img), check_format(alpha)
-        image = clip_percentile(image, percentile_image)
-        image = normalize(image)
+        # percentile_image=1.0
+        # image, alpha = check_format(img), check_format(alpha)
+        # image = clip_percentile(image, percentile_image)
+        normalize = transforms.Normalize(mean=[0.2, 0.2, 0.2], std=[0.5, 0.5, 0.5])
 
-        # print(image.shape)
+        # もしimgがTensorならPIL Imageに変換
+        if isinstance(img, torch.Tensor):
+            print("Tensor to PIL Image")
+            PIL_img = transforms.ToPILImage()(img)
+        test_transform = transforms.Compose([
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize
+        ])
+        image = test_transform(PIL_img).unsqueeze(0)
 
-        image = torch.from_numpy(np.array(image)).permute(2, 0, 1)[None, :, :, :]
+        # image = torch.from_numpy(np.array(image)).permute(2, 0, 1)[None, :, :, :]
         image = image.to("cuda")
-
-        # print(image.shape) #(1, 3, 224, 224) #(1, 3, 1280, 1280)
 
         logits = model(image)
         probabilities = torch.nn.functional.softmax(logits, dim=1)
